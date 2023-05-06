@@ -5,10 +5,19 @@
 
 #include <vector>
 #include <thread>
+#include <stdio.h>
 
 std::thread g_worker;
 
 std::vector<struct whisper_context *> g_contexts(4, nullptr);
+
+std::string to_ms(int64_t t) {
+    int64_t msec = t * 10;
+    char buf[100];
+    snprintf(buf, sizeof(buf), "%lld", msec);
+
+    return std::string(buf);
+}
 
 EMSCRIPTEN_BINDINGS(whisper) {
     emscripten::function("init", emscripten::optional_override([](const std::string & path_model) {
@@ -41,6 +50,84 @@ EMSCRIPTEN_BINDINGS(whisper) {
             whisper_free(g_contexts[index]);
             g_contexts[index] = nullptr;
         }
+    }));
+
+    emscripten::function("word_level_transcription",
+    emscripten::optional_override([](size_t index,const emscripten::val & audio) {
+        if (g_worker.joinable()) {
+            g_worker.join();
+        }
+
+        --index;
+
+        if (index >= g_contexts.size()) {
+            return -1;
+        }
+
+        if (g_contexts[index] == nullptr) {
+            return -2;
+        }
+
+        struct whisper_full_params params = whisper_full_default_params(whisper_sampling_strategy::WHISPER_SAMPLING_GREEDY);
+        
+        params.max_len = 1;
+        params.token_timestamps = true;
+        params.split_on_word = true;
+        params.print_realtime   = false;
+        params.print_progress   = false;
+        params.print_timestamps = true;
+        params.print_special    = false;
+        params.translate        = false;
+        params.language         = "en";
+        params.n_threads        = std::min(8, (int) std::thread::hardware_concurrency());
+        params.offset_ms        = 0;
+
+        std::vector<float> pcmf32;
+        const int n = audio["length"].as<int>();
+
+        emscripten::val heap = emscripten::val::module_property("HEAPU8");
+        emscripten::val memory = heap["buffer"];
+
+        pcmf32.resize(n);
+
+        emscripten::val memoryView = audio["constructor"].new_(memory, reinterpret_cast<uintptr_t>(pcmf32.data()), n);
+        memoryView.call<void>("set", audio);
+
+        g_worker = std::thread([index, params, pcmf32 = std::move(pcmf32)]() {
+                whisper_full(g_contexts[index], params, pcmf32.data(), pcmf32.size());
+
+                const int n_segments = whisper_full_n_segments(g_contexts[index]);
+                std::string json_response("[");
+                for (int i = 0; i < n_segments; ++i) {
+                    const std::string text(whisper_full_get_segment_text(g_contexts[index], i));
+                    const int64_t t0 = whisper_full_get_segment_t0(g_contexts[index], i);
+                    const int64_t t1 = whisper_full_get_segment_t1(g_contexts[index], i);
+                    json_response += "{\"text\":\"";
+                    json_response += text;
+                    json_response += "\",\"t0\":";
+                    json_response += to_ms(t0);
+                    json_response += ",\"t1\":";
+                    json_response += to_ms(t1);
+                    json_response += "},";
+                    //emscripten_log(EM_LOG_NO_PATHS, "wordtext:: %s, t0 %lld , t1 %lld", text.c_str(), t0 * 10, t1 *10);
+                }
+                json_response.pop_back();
+                json_response += "]";
+                MAIN_THREAD_EM_ASM({
+                    if(!window.word_level_transcription_response){
+                        window.word_level_transcription_response = function(x){
+                            console.log(x);
+                        }
+                    }
+                    window.word_level_transcription_response(UTF8ToString($0));
+                }, json_response.c_str());
+                //log_string(json_response.c_str());
+            });
+    
+
+
+        return 0;
+
     }));
 
     emscripten::function("full_default", emscripten::optional_override([](size_t index, const emscripten::val & audio, const std::string & lang, bool translate) {
